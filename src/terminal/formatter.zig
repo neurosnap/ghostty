@@ -18,6 +18,7 @@ const Pin = PageList.Pin;
 const Row = @import("page.zig").Row;
 const Selection = @import("Selection.zig");
 const Style = @import("style.zig").Style;
+const build_options = @import("terminal_options");
 
 /// Formats available.
 pub const Format = lib.Enum(lib.target, &.{
@@ -476,6 +477,9 @@ pub const ScreenFormatter = struct {
         /// Emit Kitty keyboard protocol state using CSI > u and CSI = sequences.
         kitty_keyboard: bool,
 
+        /// Emit Kitty graphics protocol state
+        kitty_graphics: bool,
+
         /// Emit character set designations and invocations.
         /// This includes G0-G3 designations (ESC ( ) * +) and GL/GR invocations.
         charsets: bool,
@@ -486,6 +490,7 @@ pub const ScreenFormatter = struct {
             .style = false,
             .hyperlink = false,
             .protection = false,
+            .kitty_graphics = false,
             .kitty_keyboard = false,
             .charsets = false,
         };
@@ -496,6 +501,7 @@ pub const ScreenFormatter = struct {
             .style = true,
             .hyperlink = true,
             .protection = false,
+            .kitty_graphics = false,
             .kitty_keyboard = false,
             .charsets = false,
         };
@@ -507,6 +513,7 @@ pub const ScreenFormatter = struct {
             .style = true,
             .hyperlink = true,
             .protection = true,
+            .kitty_graphics = true,
             .kitty_keyboard = true,
             .charsets = true,
         };
@@ -602,6 +609,72 @@ pub const ScreenFormatter = struct {
             if (current_flags.int() != kitty.KeyFlags.disabled.int()) {
                 const flags = current_flags.int();
                 try writer.print("\x1b[={d};1u", .{flags});
+            }
+        }
+
+        if (self.extra.kitty_graphics) {
+            if (comptime build_options.kitty_graphics) {
+                const encoder = std.base64.standard.Encoder;
+                var seen_images: std.AutoArrayHashMapUnmanaged(u32, void) = .{};
+                defer seen_images.deinit(self.screen.alloc);
+
+                var p_iter = self.screen.kitty_images.placements.iterator();
+                while (p_iter.next()) |p_entry| {
+                    const key = p_entry.key_ptr.*;
+                    const placement = p_entry.value_ptr.*;
+
+                    // If there are multiple placements for the same image
+                    // we only want to transmit the image once.
+                    if (!seen_images.contains(key.image_id)) {
+                        if (self.screen.kitty_images.imageById(key.image_id)) |img| {
+                            const encoded_size = encoder.calcSize(img.data.len);
+                            const encoded_buf = self.screen.alloc.alloc(u8, encoded_size) catch {
+                                return error.WriteFailed;
+                            };
+                            defer self.screen.alloc.free(encoded_buf);
+
+                            _ = encoder.encode(encoded_buf, img.data);
+                            // Chunk the image data
+                            const chunk_size = 4096;
+                            var start: usize = 0;
+                            while (start < encoded_buf.len) {
+                                const end = @min(start + chunk_size, encoded_buf.len);
+                                const is_last = end == encoded_buf.len;
+                                const more_flag: u32 = if (is_last) 0 else 1;
+
+                                // q=1 so we supress OK messages being
+                                // printed.
+                                const seq = std.fmt.allocPrint(
+                                    self.screen.alloc,
+                                    "\x1b_Ga=t,q=1,f={d},s={d},v={d},i={d},m={d};{s}\x1b\\",
+                                    .{
+                                        kitty.graphics.Transmission.protocolValue(img.format),
+                                        img.width,
+                                        img.height,
+                                        img.id,
+                                        more_flag,
+                                        encoded_buf[start..end],
+                                    },
+                                ) catch return error.WriteFailed;
+                                defer self.screen.alloc.free(seq);
+                                try writer.writeAll(seq);
+                                start = end;
+                            }
+                        }
+                        seen_images.put(self.screen.alloc, key.image_id, {}) catch {
+                            return error.WriteFailed;
+                        };
+                    }
+
+                    // q=1 so we supress OK messages being printed.
+                    const p_seq = std.fmt.allocPrint(
+                        self.screen.alloc,
+                        "\x1b_Ga=p,q=1,i={d},c={d},r={d}\x1b\\",
+                        .{ key.image_id, placement.columns, placement.rows },
+                    ) catch return error.WriteFailed;
+                    defer self.screen.alloc.free(p_seq);
+                    try writer.writeAll(p_seq);
+                }
             }
         }
 
@@ -4871,6 +4944,64 @@ test "Screen vt with kitty keyboard" {
     for (0..output.len) |i| {
         try testing.expectEqual(node, pin_map.items[i].node);
     }
+}
+
+test "Screen vt with kitty graphics" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("\x1b[H");
+    // 2x2 red block
+    s.nextSlice("\x1b_Ga=T,f=24,s=2,v=2;/wAA/wAA/wAA/wAA\x1b\\");
+    std.debug.print("Images after nextSlice: {}\n", .{t.screens.active.kitty_images.images.count()});
+
+    var pin_map: std.ArrayList(Pin) = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: ScreenFormatter = .init(t.screens.active, .vt);
+    formatter.extra.kitty_graphics = true;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // Create a second terminal and apply the output
+    var t2 = try Terminal.init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+
+    s2.nextSlice(output);
+
+    try testing.expectEqual(t.screens.active.kitty_images.images.count(), 1);
+    try testing.expectEqual(t2.screens.active.kitty_images.images.count(), 1);
+    var iter = t.screens.active.kitty_images.images.iterator();
+    const orig_img = iter.next().?.value_ptr.*;
+    var iter2 = t2.screens.active.kitty_images.images.iterator();
+    const rest_img = iter2.next().?.value_ptr.*;
+
+    try testing.expectEqual(orig_img.width, rest_img.width);
+    try testing.expectEqual(orig_img.height, rest_img.height);
+    try testing.expectEqual(orig_img.format, rest_img.format);
+    try testing.expectEqualSlices(u8, orig_img.data, rest_img.data);
 }
 
 test "Screen vt with charsets" {
