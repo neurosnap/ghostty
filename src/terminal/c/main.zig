@@ -18,6 +18,7 @@ pub const mouse_event = @import("mouse_event.zig");
 pub const mouse_encode = @import("mouse_encode.zig");
 pub const paste = @import("paste.zig");
 pub const row = @import("row.zig");
+pub const selection = @import("selection.zig");
 pub const sgr = @import("sgr.zig");
 pub const size_report = @import("size_report.zig");
 pub const style = @import("style.zig");
@@ -150,6 +151,14 @@ pub const grid_ref_row = grid_ref.grid_ref_row;
 pub const grid_ref_graphemes = grid_ref.grid_ref_graphemes;
 pub const grid_ref_style = grid_ref.grid_ref_style;
 
+pub const terminal_select = selection.select;
+pub const terminal_select_clear = selection.select_clear;
+pub const terminal_has_selection = selection.has_selection;
+pub const terminal_selection_contains = selection.selection_contains;
+pub const terminal_selection_bounds = selection.selection_bounds;
+pub const terminal_selection_to_string = selection.selection_to_string;
+pub const terminal_selection_to_string_alloc = selection.selection_to_string_alloc;
+
 test {
     _ = allocator;
     _ = buildpkg;
@@ -157,6 +166,7 @@ test {
     _ = color;
     _ = grid_ref;
     _ = row;
+    _ = selection;
     _ = focus;
     _ = formatter;
     _ = modes;

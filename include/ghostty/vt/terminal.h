@@ -18,6 +18,7 @@
 #include <ghostty/vt/grid_ref.h>
 #include <ghostty/vt/screen.h>
 #include <ghostty/vt/point.h>
+#include <ghostty/vt/selection.h>
 #include <ghostty/vt/style.h>
 
 #ifdef __cplusplus

@@ -218,6 +218,13 @@ comptime {
         @export(&c.grid_ref_row, .{ .name = "ghostty_grid_ref_row" });
         @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
         @export(&c.grid_ref_style, .{ .name = "ghostty_grid_ref_style" });
+        @export(&c.terminal_select, .{ .name = "ghostty_terminal_select" });
+        @export(&c.terminal_select_clear, .{ .name = "ghostty_terminal_select_clear" });
+        @export(&c.terminal_has_selection, .{ .name = "ghostty_terminal_has_selection" });
+        @export(&c.terminal_selection_contains, .{ .name = "ghostty_terminal_selection_contains" });
+        @export(&c.terminal_selection_bounds, .{ .name = "ghostty_terminal_selection_bounds" });
+        @export(&c.terminal_selection_to_string, .{ .name = "ghostty_terminal_selection_to_string" });
+        @export(&c.terminal_selection_to_string_alloc, .{ .name = "ghostty_terminal_selection_to_string_alloc" });
         @export(&c.build_info, .{ .name = "ghostty_build_info" });
         @export(&c.type_json, .{ .name = "ghostty_type_json" });
         @export(&c.alloc_alloc, .{ .name = "ghostty_alloc" });
