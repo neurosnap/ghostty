@@ -16,9 +16,7 @@
 
 /* Forward declaration to avoid circular include with terminal.h.
  * The full typedef is in terminal.h. */
-#ifndef GHOSTTY_VT_TERMINAL_H
 typedef struct GhosttyTerminalImpl* GhosttyTerminal;
-#endif
 
 #ifdef __cplusplus
 extern "C" {
