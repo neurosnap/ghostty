@@ -25,10 +25,14 @@ pub fn init(
     // Terminal module build options
     var vt_options = cfg.terminalOptions();
     vt_options.artifact = .lib;
-    // We presently don't allow Oniguruma in our Zig module at all.
-    // We should expose this as a build option in the future so we can
-    // conditionally do this.
-    vt_options.oniguruma = false;
+    // Oniguruma for the Zig module is disabled by default but can be
+    // enabled with -Doniguruma=true. When enabled, it pulls in more
+    // build-time dependencies and adds libc as a runtime dependency.
+    vt_options.oniguruma = b.option(
+        bool,
+        "oniguruma",
+        "Enable Oniguruma regex support for the Zig module (enables kitty graphics, tmux control mode).",
+    ) orelse false;
 
     var simd_libs: SharedDeps.LazyPathList = .empty;
 
@@ -96,6 +100,35 @@ fn initVt(
     // If SIMD is enabled, add all our SIMD dependencies.
     if (cfg.simd) {
         try SharedDeps.addSimd(b, vt, simd_libs);
+    }
+
+    // Conditionally add oniguruma for regex support (enables kitty graphics, tmux).
+    if (vt_options.oniguruma) {
+        if (b.lazyDependency("oniguruma", .{
+            .target = cfg.target,
+            .optimize = cfg.optimize,
+        })) |oniguruma_dep| {
+            vt.addImport("oniguruma", oniguruma_dep.module("oniguruma"));
+            if (b.systemIntegrationOption("oniguruma", .{})) {
+                vt.*.linkSystemLibrary("oniguruma", .{
+                    .preferred_link_mode = .dynamic,
+                    .search_strategy = .mode_first,
+                });
+            } else {
+                vt.*.linkLibrary(oniguruma_dep.artifact("oniguruma"));
+                if (simd_libs) |libs| {
+                    try libs.append(b.allocator, oniguruma_dep.artifact("oniguruma").getEmittedBin());
+                }
+            }
+        }
+
+        // wuffs is needed for kitty graphics images
+        if (b.lazyDependency("wuffs", .{
+            .target = cfg.target,
+            .optimize = cfg.optimize,
+        })) |wuffs_dep| {
+            vt.addImport("wuffs", wuffs_dep.module("wuffs"));
+        }
     }
 
     return vt;
