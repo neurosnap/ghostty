@@ -4,6 +4,7 @@
     .fingerprint = 0x578de530797eafe6,
     .dependencies = .{
         .ghostty = .{ .path = "../../" },
+        .wuffs = .{ .path = "../../pkg/wuffs" },
     },
     .paths = .{
         "build.zig",

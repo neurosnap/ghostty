@@ -19,6 +19,137 @@ const Row = @import("page.zig").Row;
 const Selection = @import("Selection.zig");
 const Style = @import("style.zig").Style;
 const build_options = @import("terminal_options");
+const ImageStorage = kitty.graphics.ImageStorage;
+
+/// State for emitting kitty graphics inline during content formatting.
+/// This is constructed by ScreenFormatter and passed down to PageListFormatter
+/// and PageFormatter so that image transmissions and placements can be emitted
+/// at the correct cursor position during row-by-row content emission.
+const KittyGfxState = struct {
+    images: *const ImageStorage,
+    alloc: Allocator,
+    /// Track which images have been transmitted so each is only sent once.
+    seen_images: std.AutoArrayHashMapUnmanaged(u32, void),
+
+    /// Whether any placements have been emitted.
+    emitted: bool = false,
+
+    /// The row the virtual terminal's cursor is on, used to cap
+    /// trailing blank row emission.
+    cursor_y: size.CellCountInt = 0,
+
+    fn init(images: *const ImageStorage, alloc: Allocator, cursor_y: size.CellCountInt) KittyGfxState {
+        return .{
+            .images = images,
+            .alloc = alloc,
+            .seen_images = .{},
+            .cursor_y = cursor_y,
+        };
+    }
+
+    fn deinit(self: *KittyGfxState) void {
+        self.seen_images.deinit(self.alloc);
+    }
+
+    /// Check if there are any placements pinned to the given page node and row.
+    fn hasPlacementForRow(
+        self: *KittyGfxState,
+        node: *PageList.List.Node,
+        y: size.CellCountInt,
+    ) bool {
+        if (comptime !build_options.kitty_graphics) return false;
+
+        var p_iter = self.images.placements.iterator();
+        while (p_iter.next()) |p_entry| {
+            const placement = p_entry.value_ptr.*;
+            const pin = switch (placement.location) {
+                .pin => |p| p,
+                .virtual => continue,
+            };
+            if (pin.node == node and pin.y == y) return true;
+        }
+        return false;
+    }
+
+    /// Emit any kitty graphics placements that are pinned to the given
+    /// page node and row. Called inline during content emission so the
+    /// cursor is naturally at the correct row position.
+    fn emitForRow(
+        self: *KittyGfxState,
+        writer: *std.Io.Writer,
+        node: *PageList.List.Node,
+        y: size.CellCountInt,
+    ) std.Io.Writer.Error!void {
+        if (comptime !build_options.kitty_graphics) return;
+
+        const encoder = std.base64.standard.Encoder;
+        var p_iter = self.images.placements.iterator();
+        while (p_iter.next()) |p_entry| {
+            const key = p_entry.key_ptr.*;
+            const placement = p_entry.value_ptr.*;
+
+            // Only handle pin-based placements on this specific node+row.
+            const pin = switch (placement.location) {
+                .pin => |p| p,
+                .virtual => continue,
+            };
+            if (pin.node != node or pin.y != y) continue;
+
+            // Transmit image data if not already sent.
+            if (!self.seen_images.contains(key.image_id)) {
+                if (self.images.imageById(key.image_id)) |img| {
+                    const encoded_size = encoder.calcSize(img.data.len);
+                    const encoded_buf = self.alloc.alloc(u8, encoded_size) catch {
+                        return error.WriteFailed;
+                    };
+                    defer self.alloc.free(encoded_buf);
+
+                    _ = encoder.encode(encoded_buf, img.data);
+
+                    const chunk_size = 4096;
+                    var start: usize = 0;
+                    while (start < encoded_buf.len) {
+                        const end = @min(start + chunk_size, encoded_buf.len);
+                        const is_last = end == encoded_buf.len;
+                        const more_flag: u32 = if (is_last) 0 else 1;
+
+                        const seq = std.fmt.allocPrint(
+                            self.alloc,
+                            "\x1b_Ga=t,q=1,f={d},s={d},v={d},i={d},m={d};{s}\x1b\\",
+                            .{
+                                kitty.graphics.Transmission.protocolValue(img.format),
+                                img.width,
+                                img.height,
+                                img.id,
+                                more_flag,
+                                encoded_buf[start..end],
+                            },
+                        ) catch return error.WriteFailed;
+                        defer self.alloc.free(seq);
+                        try writer.writeAll(seq);
+                        start = end;
+                    }
+                }
+                self.seen_images.put(self.alloc, key.image_id, {}) catch {
+                    return error.WriteFailed;
+                };
+            }
+
+            // Move cursor to the placement's column, emit placement,
+            // then return cursor to column 1.
+            try writer.print("\x1b[{d}G", .{pin.x + 1});
+            const p_seq = std.fmt.allocPrint(
+                self.alloc,
+                "\x1b_Ga=p,q=1,C=1,i={d},c={d},r={d},X={d},Y={d}\x1b\\",
+                .{ key.image_id, placement.columns, placement.rows, placement.x_offset, placement.y_offset },
+            ) catch return error.WriteFailed;
+            defer self.alloc.free(p_seq);
+            try writer.writeAll(p_seq);
+            try writer.print("\x1b[1G", .{});
+            self.emitted = true;
+        }
+    }
+};
 
 /// Formats available.
 pub const Format = lib.Enum(lib.target, &.{
@@ -542,6 +673,18 @@ pub const ScreenFormatter = struct {
         self: ScreenFormatter,
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
+        // Setup kitty graphics state if needed. This is passed down to
+        // the page formatters so placements are emitted inline during
+        // content row iteration.
+        const need_kitty_gfx = self.opts.emit == .vt and
+            self.extra.kitty_graphics and
+            comptime build_options.kitty_graphics;
+        var kitty_gfx_state: ?KittyGfxState = if (need_kitty_gfx)
+            KittyGfxState.init(&self.screen.kitty_images, self.screen.alloc, self.screen.cursor.y)
+        else
+            null;
+        defer if (kitty_gfx_state) |*s| s.deinit();
+
         switch (self.content) {
             .none => {},
 
@@ -549,6 +692,7 @@ pub const ScreenFormatter = struct {
                 // Emit our pagelist contents according to our selection.
                 var list_formatter: PageListFormatter = .init(&self.screen.pages, self.opts);
                 list_formatter.pin_map = self.pin_map;
+                list_formatter.kitty_gfx = if (kitty_gfx_state) |*s| s else null;
                 if (selection_) |sel| {
                     list_formatter.top_left = sel.topLeft(self.screen);
                     list_formatter.bottom_right = sel.bottomRight(self.screen);
@@ -612,71 +756,8 @@ pub const ScreenFormatter = struct {
             }
         }
 
-        if (self.extra.kitty_graphics) {
-            if (comptime build_options.kitty_graphics) {
-                const encoder = std.base64.standard.Encoder;
-                var seen_images: std.AutoArrayHashMapUnmanaged(u32, void) = .{};
-                defer seen_images.deinit(self.screen.alloc);
-
-                var p_iter = self.screen.kitty_images.placements.iterator();
-                while (p_iter.next()) |p_entry| {
-                    const key = p_entry.key_ptr.*;
-                    const placement = p_entry.value_ptr.*;
-
-                    // If there are multiple placements for the same image
-                    // we only want to transmit the image once.
-                    if (!seen_images.contains(key.image_id)) {
-                        if (self.screen.kitty_images.imageById(key.image_id)) |img| {
-                            const encoded_size = encoder.calcSize(img.data.len);
-                            const encoded_buf = self.screen.alloc.alloc(u8, encoded_size) catch {
-                                return error.WriteFailed;
-                            };
-                            defer self.screen.alloc.free(encoded_buf);
-
-                            _ = encoder.encode(encoded_buf, img.data);
-                            // Chunk the image data
-                            const chunk_size = 4096;
-                            var start: usize = 0;
-                            while (start < encoded_buf.len) {
-                                const end = @min(start + chunk_size, encoded_buf.len);
-                                const is_last = end == encoded_buf.len;
-                                const more_flag: u32 = if (is_last) 0 else 1;
-
-                                // q=1 so we supress OK messages being
-                                // printed.
-                                const seq = std.fmt.allocPrint(
-                                    self.screen.alloc,
-                                    "\x1b_Ga=t,q=1,f={d},s={d},v={d},i={d},m={d};{s}\x1b\\",
-                                    .{
-                                        kitty.graphics.Transmission.protocolValue(img.format),
-                                        img.width,
-                                        img.height,
-                                        img.id,
-                                        more_flag,
-                                        encoded_buf[start..end],
-                                    },
-                                ) catch return error.WriteFailed;
-                                defer self.screen.alloc.free(seq);
-                                try writer.writeAll(seq);
-                                start = end;
-                            }
-                        }
-                        seen_images.put(self.screen.alloc, key.image_id, {}) catch {
-                            return error.WriteFailed;
-                        };
-                    }
-
-                    // q=1 so we supress OK messages being printed.
-                    const p_seq = std.fmt.allocPrint(
-                        self.screen.alloc,
-                        "\x1b_Ga=p,q=1,i={d},c={d},r={d}\x1b\\",
-                        .{ key.image_id, placement.columns, placement.rows },
-                    ) catch return error.WriteFailed;
-                    defer self.screen.alloc.free(p_seq);
-                    try writer.writeAll(p_seq);
-                }
-            }
-        }
+        // Kitty graphics are emitted inline during content iteration
+        // via KittyGfxState, so nothing to do here.
 
         // Emit character set designations and invocations
         if (self.extra.charsets) {
@@ -789,6 +870,9 @@ pub const PageListFormatter = struct {
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
 
+    /// Optional kitty graphics state for inline placement emission.
+    kitty_gfx: ?*KittyGfxState = null,
+
     pub fn init(
         list: *const PageList,
         opts: Options,
@@ -800,6 +884,7 @@ pub const PageListFormatter = struct {
             .bottom_right = null,
             .rectangle = false,
             .pin_map = null,
+            .kitty_gfx = null,
         };
     }
 
@@ -825,6 +910,8 @@ pub const PageListFormatter = struct {
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
             formatter.rectangle = self.rectangle;
+            formatter.kitty_gfx = self.kitty_gfx;
+            formatter.kitty_gfx_node = chunk.node;
 
             // For rectangle selection, apply start_x and end_x to all chunks
             if (self.rectangle) {
@@ -913,6 +1000,12 @@ pub const PageFormatter = struct {
     /// over multiple pages this helps ensure that unwrapping and other
     /// accounting works properly.
     trailing_state: ?TrailingState,
+
+    /// Optional kitty graphics state for inline placement emission.
+    kitty_gfx: ?*KittyGfxState = null,
+
+    /// The page list node for this page, needed to match placements.
+    kitty_gfx_node: ?*PageList.List.Node = null,
 
     /// Trailing state. This is used to ensure that rows wrapped across
     /// multiple pages are unwrapped properly, as well as other accounting
@@ -1115,8 +1208,31 @@ pub const PageFormatter = struct {
 
             // If this row is blank, accumulate to avoid a bunch of extra
             // work later. If it isn't blank, make sure we dump all our
-            // blanks.
+            // blanks. However, if this blank row has kitty graphics
+            // placements, we need to emit the accumulated blank rows
+            // and the placement before continuing.
             if (!Cell.hasTextAny(cells_subset)) {
+                if (self.kitty_gfx) |gfx| {
+                    if (self.kitty_gfx_node) |node| {
+                        if (gfx.hasPlacementForRow(node, y)) {
+                            // Flush accumulated blank rows as newlines
+                            // so the cursor is on the correct row.
+                            blank_rows += 1;
+                            const sequence: []const u8 = switch (self.opts.emit) {
+                                .plain => "\n",
+                                .vt => "\r\n",
+                                .html => "\n",
+                            };
+                            for (0..blank_rows) |_| try writer.writeAll(sequence);
+                            blank_rows = 0;
+
+                            try gfx.emitForRow(writer, node, y);
+                            // Add a blank row for the newline after this row.
+                            blank_rows += 1;
+                            continue;
+                        }
+                    }
+                }
                 blank_rows += 1;
                 continue;
             }
@@ -1405,6 +1521,41 @@ pub const PageFormatter = struct {
                             .{ .x = x, .y = y },
                         ) catch return error.WriteFailed;
                     },
+                }
+            }
+
+            // Emit any kitty graphics placements pinned to this row.
+            if (self.kitty_gfx) |gfx| {
+                if (self.kitty_gfx_node) |node| {
+                    try gfx.emitForRow(writer, node, y);
+                }
+            }
+        }
+
+        // If kitty graphics placements were emitted, flush enough
+        // trailing blank rows to advance the cursor past the last
+        // image's visual extent (up to cursor_y). Without this, the
+        // shell prompt would overlap the bottom of the last image.
+        // We don't flush ALL trailing blanks since that would include
+        // empty rows to the bottom of the screen.
+        if (self.kitty_gfx) |gfx| {
+            if (gfx.emitted and blank_rows > 0) {
+                // The end_y_val is the last row index we iterated.
+                // blank_rows includes the trailing newline count.
+                // We want to emit newlines only up to cursor_y.
+                const end_y_val: size.CellCountInt = self.end_y orelse self.page.size.rows - 1;
+                const rows_to_emit = if (gfx.cursor_y > end_y_val - @as(size.CellCountInt, @intCast(blank_rows)))
+                    @min(blank_rows, @as(usize, gfx.cursor_y) - @as(usize, end_y_val - @as(size.CellCountInt, @intCast(blank_rows))))
+                else
+                    0;
+                if (rows_to_emit > 0) {
+                    const sequence: []const u8 = switch (self.opts.emit) {
+                        .plain => "\n",
+                        .vt => "\r\n",
+                        .html => "\n",
+                    };
+                    for (0..rows_to_emit) |_| try writer.writeAll(sequence);
+                    blank_rows -= rows_to_emit;
                 }
             }
         }

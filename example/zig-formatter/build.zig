@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
         );
     }
 
+    if (b.lazyDependency("wuffs", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        exe_mod.addImport("wuffs", dep.module("wuffs"));
+    }
+
     const exe = b.addExecutable(.{
         .name = "zig_formatter",
         .root_module = exe_mod,
