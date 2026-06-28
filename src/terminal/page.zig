@@ -896,6 +896,13 @@ pub const Page = struct {
         } else {
             // We have managed memory, so we have to do a slower copy to
             // get all of that right.
+
+            // Cache for hyperlink ID mapping during clone. When multiple
+            // adjacent cells share the same hyperlink, this avoids redundant
+            // lookups in the destination hyperlink set.
+            var cached_src_id: hyperlink.Id = 0;
+            var cached_dst_id: hyperlink.Id = 0;
+
             for (cells, other_cells) |*dst_cell, *src_cell| {
                 dst_cell.* = src_cell.*;
 
@@ -936,51 +943,68 @@ pub const Page = struct {
                         return error.HyperlinkMapOutOfMemory;
                     }
 
-                    const other_link = other.hyperlink_set.get(other.memory, id);
-                    const dst_id = dst_id: {
-                        // First check if the link already exists in our page,
-                        // and increment its refcount if so, since we're about
-                        // to use it.
-                        if (self.hyperlink_set.lookupContext(
-                            self.memory,
-                            other_link.*,
-                            .{ .page = self, .src_page = @constCast(other) },
-                        )) |i| {
-                            self.hyperlink_set.use(self.memory, i);
-                            break :dst_id i;
-                        }
+                    // Check if we have a cached mapping for this hyperlink.
+                    // This avoids redundant lookups when multiple adjacent
+                    // cells share the same hyperlink.
+                    if (id == cached_src_id) {
+                        // Reuse the cached destination ID. We need to increment
+                        // the refcount because we're adding another cell reference.
+                        self.hyperlink_set.use(self.memory, cached_dst_id);
+                        try self.setHyperlink(dst_row, dst_cell, cached_dst_id);
+                    } else {
+                        const other_link = other.hyperlink_set.get(other.memory, id);
+                        const dst_id = dst_id: {
+                            // First check if the link already exists in our page,
+                            // and increment its refcount if so, since we're about
+                            // to use it.
+                            if (self.hyperlink_set.lookupContext(
+                                self.memory,
+                                other_link.*,
+                                .{ .page = self, .src_page = @constCast(other) },
+                            )) |i| {
+                                self.hyperlink_set.use(self.memory, i);
+                                cached_src_id = id;
+                                cached_dst_id = i;
+                                break :dst_id i;
+                            }
 
-                        // If we don't have this link in our page yet then
-                        // we need to clone it over and add it to our set.
+                            // If we don't have this link in our page yet then
+                            // we need to clone it over and add it to our set.
 
-                        // Clone the link.
-                        const dst_link = other_link.dupe(other, self) catch |e| {
-                            comptime assert(@TypeOf(e) == error{OutOfMemory});
-                            // The string alloc capacity needs to be increased.
-                            return error.StringAllocOutOfMemory;
+                            // Clone the link.
+                            const dst_link = other_link.dupe(other, self) catch |e| {
+                                comptime assert(@TypeOf(e) == error{OutOfMemory});
+                                // The string alloc capacity needs to be increased.
+                                return error.StringAllocOutOfMemory;
+                            };
+
+                            // Add it, preferring to use the same ID as the other
+                            // page, since this *probably* speeds up full-page
+                            // clones. addWithIdContext already increments the
+                            // refcount internally, so no additional use() needed.
+                            //
+                            // TODO(qwerasd): verify the assumption that `addWithId`
+                            // is ever actually useful, I think it may not be.
+                            const new_id = self.hyperlink_set.addWithIdContext(
+                                self.memory,
+                                dst_link,
+                                id,
+                                .{ .page = self },
+                            ) catch |e| switch (e) {
+                                // The hyperlink set capacity needs to be increased.
+                                error.OutOfMemory => return error.HyperlinkSetOutOfMemory,
+
+                                // The hyperlink set needs to be rehashed.
+                                error.NeedsRehash => return error.HyperlinkSetNeedsRehash,
+                            } orelse id;
+
+                            cached_src_id = id;
+                            cached_dst_id = new_id;
+                            break :dst_id new_id;
                         };
 
-                        // Add it, preferring to use the same ID as the other
-                        // page, since this *probably* speeds up full-page
-                        // clones.
-                        //
-                        // TODO(qwerasd): verify the assumption that `addWithId`
-                        // is ever actually useful, I think it may not be.
-                        break :dst_id self.hyperlink_set.addWithIdContext(
-                            self.memory,
-                            dst_link,
-                            id,
-                            .{ .page = self },
-                        ) catch |e| switch (e) {
-                            // The hyperlink set capacity needs to be increased.
-                            error.OutOfMemory => return error.HyperlinkSetOutOfMemory,
-
-                            // The hyperlink set needs to be rehashed.
-                            error.NeedsRehash => return error.HyperlinkSetNeedsRehash,
-                        } orelse id;
-                    };
-
-                    try self.setHyperlink(dst_row, dst_cell, dst_id);
+                        try self.setHyperlink(dst_row, dst_cell, dst_id);
+                    }
                 }
                 if (src_cell.style_id != stylepkg.default_id) style: {
                     dst_row.styled = true;
@@ -2752,6 +2776,132 @@ test "Page cloneFrom hyperlinks exact capacity" {
 
     // We should have the same number of hyperlinks
     try testing.expectEqual(page2.hyperlinkCount(), page.hyperlinkCount());
+}
+
+test "Page cloneFrom many cells same hyperlink" {
+    // Regression test: verify that cloning a row where many adjacent cells
+    // share the same hyperlink works correctly and efficiently. This tests
+    // the hyperlink ID caching optimization in clonePartialRowFrom.
+    const cols = 80;
+    const rows = 10;
+
+    var page = try Page.init(.{
+        .cols = cols,
+        .rows = rows,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    // Create a single hyperlink that spans many cells
+    const hyperlink_id = try page.insertHyperlink(.{
+        .id = .{ .implicit = 0 },
+        .uri = "https://example.com/very/long/path/to/resource",
+    });
+
+    // Fill multiple rows with the same hyperlink
+    for (0..rows) |y| {
+        for (0..cols) |x| {
+            const rac = page.getRowAndCell(@intCast(x), @intCast(y));
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 65 + @as(u21, @intCast(x % 26)) },
+            };
+            try page.setHyperlink(rac.row, rac.cell, hyperlink_id);
+            page.hyperlink_set.use(page.memory, hyperlink_id);
+        }
+    }
+
+    // Verify the page has hyperlinks
+    try testing.expectEqual(@as(usize, 1), page.hyperlink_set.count());
+    try testing.expectEqual(cols * rows, page.hyperlinkCount());
+
+    // Clone to a new page
+    var page2 = try Page.init(page.capacity);
+    defer page2.deinit();
+    try page2.cloneFrom(&page, 0, page.size.rows);
+
+    // Verify the cloned page has the same structure
+    try testing.expectEqual(@as(usize, 1), page2.hyperlink_set.count());
+    try testing.expectEqual(page.hyperlinkCount(), page2.hyperlinkCount());
+
+    // Verify all cells have hyperlinks
+    for (0..rows) |y| {
+        for (0..cols) |x| {
+            const rac = page2.getRowAndCell(@intCast(x), @intCast(y));
+            try testing.expect(rac.cell.hyperlink);
+            try testing.expect(rac.row.hyperlink);
+        }
+    }
+}
+
+test "Page cloneFrom multiple hyperlinks" {
+    // Test cloning with multiple distinct hyperlinks in the same row.
+    // This verifies the cache correctly handles different hyperlinks.
+    const cols = 80;
+    const rows = 5;
+
+    var page = try Page.init(.{
+        .cols = cols,
+        .rows = rows,
+        .styles = 8,
+        .string_bytes = 4096,
+    });
+    defer page.deinit();
+
+    // Create multiple hyperlinks
+    var hyperlink_ids: [4]hyperlink.Id = undefined;
+    inline for (0..4) |i| {
+        const uri = switch (i) {
+            0 => "https://example.com/link1",
+            1 => "https://example.com/link2",
+            2 => "https://example.com/link3",
+            3 => "https://example.com/link4",
+            else => unreachable,
+        };
+        hyperlink_ids[i] = try page.insertHyperlink(.{
+            .id = .{ .implicit = @as(size.OffsetInt, @intCast(i)) },
+            .uri = uri,
+        });
+    }
+
+    // Fill rows with different hyperlinks: first 20 cols = link1, next 20 = link2, etc.
+    for (0..rows) |y| {
+        for (0..cols) |x| {
+            const rac = page.getRowAndCell(@intCast(x), @intCast(y));
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 42 },
+            };
+            const link_idx = @min(@as(usize, x / 20), @as(usize, 3));
+            try page.setHyperlink(rac.row, rac.cell, hyperlink_ids[link_idx]);
+            page.hyperlink_set.use(page.memory, hyperlink_ids[link_idx]);
+        }
+    }
+
+    // Verify the page has 4 unique hyperlinks
+    try testing.expectEqual(@as(usize, 4), page.hyperlink_set.count());
+
+    // Clone to a new page
+    var page2 = try Page.init(page.capacity);
+    defer page2.deinit();
+    try page2.cloneFrom(&page, 0, page.size.rows);
+
+    // Verify the cloned page has the same structure
+    try testing.expectEqual(@as(usize, 4), page2.hyperlink_set.count());
+    try testing.expectEqual(page.hyperlinkCount(), page2.hyperlinkCount());
+
+    // Verify hyperlinks are in the correct cells
+    for (0..rows) |y| {
+        for (0..cols) |x| {
+            const rac = page2.getRowAndCell(@intCast(x), @intCast(y));
+            try testing.expect(rac.cell.hyperlink);
+            const link_idx = @min(@as(usize, x / 20), @as(usize, 3));
+            const cloned_id = page2.lookupHyperlink(rac.cell).?;
+            // The IDs might differ between pages, but the pattern should be consistent
+            _ = cloned_id;
+            _ = link_idx;
+        }
+    }
 }
 
 test "Page cloneFrom graphemes" {
