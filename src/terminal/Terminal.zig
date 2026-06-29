@@ -13257,3 +13257,90 @@ test "Terminal: glyph APC stores session glossary entries" {
     t.fullReset();
     try testing.expect(!t.glyph_glossary.contains(0xE0A0));
 }
+
+// Regression test for a hyperlink-heavy scroll crash.
+//
+// When a row that carries more hyperlinks than a page's default hyperlink
+// map capacity is scrolled across a page boundary, `cursorScrollAboveRotate`
+// rotates the destination page's rows in place (irreversible) and *then*
+// calls `cloneRowFrom`, which fails with `HyperlinkSetOutOfMemory` because
+// the cross-page clone path does not grow page capacity (unlike the analogous
+// `insertLines`/`deleteLines` paths, which catch the error and call
+// `increaseCapacity`). The error propagates out of `index`/`linefeed` and is
+// swallowed by the stream handler, leaving the page half-mutated: a row whose
+// `hyperlink` flag and cells reference a set entry that was never created.
+// A later `clearCells` over those cells then aborts the process.
+//
+// Reported via a headless ghostty-vt consumer (zmx) feeding Codex CLI output
+// — many wrapped OSC 8 file links — through the terminal model for state
+// tracking. Crash signature: SIGABRT in terminal.Screen.clearCells, preceded
+// by `error handling VT action action=.linefeed err=error.HyperlinkSetOutOfMemory`.
+//
+// This test asserts the operation should succeed (grow capacity) rather than
+// error: a scroll must never leave the page in a half-applied state.
+test "Terminal: scroll region clones hyperlink-dense row across page boundary" {
+    const alloc = testing.allocator;
+    const cols = 215;
+
+    // rows=240 at 215 cols spans two pages (~219 rows on page0, the rest on
+    // page1), so the active area straddles a page boundary.
+    var t = try init(alloc, .{ .cols = cols, .rows = 240, .max_scrollback = 100_000_000 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+
+    const page0_rows = screen.pages.pages.first.?.data.size.rows;
+
+    // Fill page0's LAST row with a hyperlink in every cell. The cursor's page
+    // grows its hyperlink map to hold all `cols` links. A freshly-created
+    // downstream page keeps the default (~64-cell) map, which is smaller than
+    // this row needs.
+    const dense_row = page0_rows - 1;
+    t.setCursorPos(dense_row + 1, 1);
+    var buf: [64]u8 = undefined;
+    var uid: usize = 0;
+    while (uid < cols) : (uid += 1) {
+        const uri = std.fmt.bufPrint(&buf, "http://e.com/{d}", .{uid}) catch unreachable;
+        try screen.startHyperlink(uri, null);
+        try t.print('A');
+        screen.endHyperlink();
+    }
+    // Sanity: this row really does carry more hyperlinks than a downstream
+    // page's default map can hold.
+    try testing.expect(cols > screen.pages.pages.last.?.data.hyperlinkCapacity());
+
+    // Top-anchored, full-width scroll region (so index() routes through
+    // cursorScrollAbove and creates scrollback). Place the cursor a few rows
+    // ABOVE page0's last row so that, after the scroll shifts everything below
+    // the cursor down by one, the dense row is pushed across the boundary into
+    // the fresh downstream page via the cross-page rotate clone.
+    const region_bottom = dense_row - 3;
+    t.setTopAndBottomMargin(1, region_bottom + 1);
+    t.setCursorPos(region_bottom + 1, 1);
+
+    // The scroll. Today this returns error.HyperlinkSetOutOfMemory and, worse,
+    // has already rotated the destination row before failing -- corrupting the
+    // page. It should instead grow the page's hyperlink capacity and succeed.
+    try t.linefeed();
+
+    // Every page must remain internally consistent after the scroll.
+    var it = screen.pages.pages.first;
+    while (it) |n| : (it = n.next) n.data.assertIntegrity();
+
+    // Belt and suspenders: even a "fix" that merely swallows the error must not
+    // leave a half-applied scroll behind. Every cell flagged as a hyperlink
+    // must resolve to a real entry in its page's hyperlink map (the missing
+    // entry is exactly what aborts in clearCells in the field).
+    it = screen.pages.pages.first;
+    while (it) |n| : (it = n.next) {
+        const page = &n.data;
+        var y: usize = 0;
+        while (y < page.size.rows) : (y += 1) {
+            const row: *Row = &page.rows.ptr(page.memory.ptr)[y];
+            if (!row.hyperlink) continue;
+            for (page.getCells(row)) |*cell| {
+                if (!cell.hyperlink) continue;
+                try testing.expect(page.lookupHyperlink(cell) != null);
+            }
+        }
+    }
+}
