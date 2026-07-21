@@ -10,6 +10,20 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
     /// be updated whenever the window background color or surrounding elements changes.
     fileprivate var isLightTheme: Bool = false
 
+    /// Observer for the NSTabBar frame. Ported from the Tahoe window: when the tab bar
+    /// resizes (system appearance change, screen configuration change, etc.), our custom
+    /// constraints can be cleared, so we re-run the tab bar setup. See #10253.
+    private var tabBarFrameObserver: NSObjectProtocol? {
+        didSet {
+            guard let oldValue else { return }
+            NotificationCenter.default.removeObserver(oldValue)
+        }
+    }
+
+    deinit {
+        tabBarFrameObserver = nil
+    }
+
     lazy var titlebarColor: NSColor = backgroundColor {
         didSet {
             guard let titlebarContainer else { return }
@@ -455,6 +469,41 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 
             self?.hideToolbarOverflowButton()
             self?.hideTitleBarSeparators()
+
+            // Ported from Tahoe (#10253): observe the tab bar frame so that if it
+            // resizes (e.g. after a screen configuration change) and clears our
+            // constraints, we re-run the setup.
+            self?.installTabBarFrameObserver()
+        }
+    }
+
+    /// Install (or reinstall) an observer on the NSTabBar frame that re-runs the
+    /// titlebar tab setup when the tab bar resizes. See #10253.
+    private func installTabBarFrameObserver() {
+        guard let tabBarView else {
+            Ghostty.logger.info("[10253] installTabBarFrameObserver BAILED: no tabBarView")
+            return
+        }
+
+        // Only install once. Cleared and reinstalled when the observer fires.
+        guard tabBarFrameObserver == nil else { return }
+
+        Ghostty.logger.info("[10253] installTabBarFrameObserver installed")
+        tabBarView.postsFrameChangedNotifications = true
+        tabBarFrameObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: tabBarView,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+
+            // Remove the observer so pushTabsToTitlebar can reinstall it.
+            self.tabBarFrameObserver = nil
+
+            Ghostty.logger.info("[10253] tabBar frameDidChange -> updateTabBar")
+            DispatchQueue.main.async {
+                self.updateTabBar()
+            }
         }
     }
 
