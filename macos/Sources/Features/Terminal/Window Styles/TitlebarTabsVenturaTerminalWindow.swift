@@ -172,6 +172,13 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 
     private var newTabButtonImageLayer: VibrantLayer?
 
+    /// Force a fresh tab bar setup. macOS 13-15 equivalent of the Tahoe window's
+    /// setup re-run. See #10253.
+    override func resetupTabBar() {
+        Ghostty.logger.info("[10253] Ventura.resetupTabBar -> updateTabBar titlebarTabs=\(self.titlebarTabs) titled=\(self.styleMask.contains(.titled)) fullScreen=\(self.styleMask.contains(.fullScreen))")
+        updateTabBar()
+    }
+
     func updateTabBar() {
         newTabButtonImageLayer = nil
         effectViewIsHidden = false
@@ -179,9 +186,15 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
         // We can only update titlebar tabs if there is a titlebar. Without the
         // styleMask check the app will crash (issue #1876)
         if titlebarTabs && styleMask.contains(.titled) {
-            guard let tabBarAccessoryViewController = titlebarAccessoryViewControllers.first(where: { $0.identifier == Self.tabBarIdentifier}) else { return }
+            guard let tabBarAccessoryViewController = titlebarAccessoryViewControllers.first(where: { $0.identifier == Self.tabBarIdentifier}) else {
+                Ghostty.logger.info("[10253] updateTabBar BAILED: no tabBar accessory view controller found")
+                return
+            }
+            Ghostty.logger.info("[10253] updateTabBar -> pushTabsToTitlebar (running)")
             tabBarAccessoryViewController.layoutAttribute = .right
             pushTabsToTitlebar(tabBarAccessoryViewController)
+        } else {
+            Ghostty.logger.info("[10253] updateTabBar SKIPPED body: titlebarTabs=\(self.titlebarTabs) titled=\(self.styleMask.contains(.titled))")
         }
     }
 

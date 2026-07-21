@@ -273,6 +273,12 @@ class TerminalWindow: NSWindow {
 
     // MARK: Tab Bar
 
+    /// Re-run whatever tab-bar setup this window style needs. Base is a no-op;
+    /// titlebar-tab styles override. See #10253.
+    func resetupTabBar() {
+        Ghostty.logger.info("[10253] resetupTabBar base no-op class=\(String(describing: type(of: self)), privacy: .public)")
+    }
+
     /// This identifier is attached to the tab bar view controller when we detect it being
     /// added.
     static let tabBarIdentifier: NSUserInterfaceItemIdentifier = .init("_ghosttyTabBar")

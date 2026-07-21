@@ -149,14 +149,28 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     /// this function which is idempotent to call.
     ///
     /// There are more scenarios to look out for and they're documented within the method.
+    /// Force a fresh tab bar setup. `setupTabBar` is a no-op if the observer is
+    /// already installed, so we clear it first. See #10253.
+    override func resetupTabBar() {
+        Ghostty.logger.info("[10253] Tahoe.resetupTabBar -> setupTabBar fullScreen=\(self.styleMask.contains(.fullScreen))")
+        tabBarObserver = nil
+        setupTabBar()
+    }
+
     func setupTabBar() {
         // We only want to setup the observer once
-        guard tabBarObserver == nil else { return }
+        guard tabBarObserver == nil else {
+            Ghostty.logger.info("[10253] setupTabBar BAILED: observer already set")
+            return
+        }
 
         guard
             let titlebarView,
             let tabBarView = self.tabBarView
-        else { return }
+        else {
+            Ghostty.logger.info("[10253] setupTabBar BAILED: titlebarView=\(self.titlebarView != nil) tabBarView=\(self.tabBarView != nil)")
+            return
+        }
 
         // View model updates must happen on their own ticks.
         DispatchQueue.main.async { [weak self] in

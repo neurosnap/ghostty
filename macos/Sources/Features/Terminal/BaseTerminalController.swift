@@ -534,9 +534,24 @@ class BaseTerminalController: NSWindowController,
         guard let window else { return }
         guard window.isVisible else { return }
 
-        // We ignore fullscreen windows because macOS automatically resizes
-        // those back to the fullscreen bounds.
-        guard !window.styleMask.contains(.fullScreen) else { return }
+        // EXPERIMENT (issue #10253): re-run the tab bar setup after a fullscreen
+        // screen change, with logging at every step to confirm it actually runs.
+        if window.styleMask.contains(.fullScreen) {
+            Ghostty.logger.info("[10253] screenChange fullScreen window=\(String(describing: type(of: window)), privacy: .public) tabGroupWindows=\(window.tabGroup?.windows.count ?? -1)")
+            guard let tabGroup = window.tabGroup, tabGroup.windows.count > 1 else {
+                Ghostty.logger.info("[10253] screenChange BAILED: no tabGroup or <=1 window")
+                return
+            }
+
+            DispatchQueue.main.async {
+                Ghostty.logger.info("[10253] screenChange async firing resetupTabBar on \(tabGroup.windows.count) windows")
+                for tabWindow in tabGroup.windows {
+                    (tabWindow as? TerminalWindow)?.resetupTabBar()
+                }
+            }
+
+            return
+        }
 
         guard let screen = window.screen else { return }
         let visibleFrame = screen.visibleFrame
